@@ -20,6 +20,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
+import pickle
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -35,8 +36,8 @@ EDGE_THR   = 0.60      # cosine threshold for an edge
 K_PER_NODE = 8         # edges per node in the graph
 MAX_HOPS   = 2         # depth for neighbour expansion
 
-MAX_CTX    = 5         # examples in each prompt
-N_PASSES   = 4         # self-consistency votes
+MAX_CTX    = 3         # examples in each prompt
+N_PASSES   = 1         # self-consistency votes
 TEMP       = 0.25
 MAX_TOK    = 6         # model response length
 
@@ -112,6 +113,7 @@ def parse_one(raw):
     return cid, desc, sev
 
 # ───────── Build Graph ─────────
+
 def build_graph():
     ids, descs, sevs = [], [], []
     for raw in tqdm(iter_cve_json(), desc="Reading CVEs"):
@@ -128,13 +130,14 @@ def build_graph():
         show_progress_bar=True,
         normalize_embeddings=True,
     )
+    embeds_tensor = torch.from_numpy(np.array(embeds))
 
     G = nx.Graph()
     G.add_nodes_from(range(len(ids)))
 
     for i in tqdm(range(len(ids)), desc="Adding edges"):
         sims = util.cos_sim(
-            torch.tensor(embeds[i]).unsqueeze(0), torch.tensor(embeds)
+            embeds_tensor[i].unsqueeze(0), embeds_tensor
         )[0]
         topk = torch.topk(sims, K_PER_NODE + 1)  # +1 to include self
         for sim_val, j in zip(topk.values.tolist(), topk.indices.tolist()):
@@ -142,7 +145,11 @@ def build_graph():
                 continue
             G.add_edge(i, j, weight=float(sim_val))
 
-    return ids, descs, sevs, G, embeds
+    np.save(f"{SAVE_DIR}/embeds.npy", embeds_tensor.numpy())
+    with open(f"{SAVE_DIR}/graph.gpickle", "wb") as f:
+        pickle.dump(G, f)
+
+    return ids, descs, sevs, G, embeds_tensor
 
 # ───────── Prompt utils ─────────
 def neighborhood(seed_nodes, G):
@@ -195,7 +202,7 @@ def apply_heur(desc, pred):
 # ───────── Main ─────────
 def main(limit):
     t0 = time.time()
-    ids, descs, sevs, G, embeds = build_graph()
+    ids, descs, sevs, G, embeds_tensor = build_graph()
     graph_build_secs = time.time() - t0
 
     dfq = (
@@ -226,11 +233,10 @@ def main(limit):
     for row in tqdm(dfq.to_dict("records"), desc="Classifying"):
         # find k nearest graph nodes to *this query* by embedding similarity
         q_emb = emb_model_q.encode(
-            row["Description"], normalize_embeddings=True
+        row["Description"], normalize_embeddings=True
         )
-        sims = util.cos_sim(
-            torch.tensor(q_emb).unsqueeze(0), torch.tensor(embeds)
-        )[0]
+        q_tensor = torch.tensor(q_emb).unsqueeze(0)
+        sims = util.cos_sim(q_tensor, embeds_tensor)[0]
         topk = torch.topk(sims, K_PER_NODE).indices.tolist()
 
         nbh = neighborhood(topk, G)
@@ -292,3 +298,4 @@ if __name__ == "__main__":
         help="first N CVEs for quick test (0 = all)",
     )
     main(ap.parse_args().limit)
+
